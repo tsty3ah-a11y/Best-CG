@@ -47,97 +47,6 @@ async function isPresent(page, selector) {
     return page.evaluate((sel) => !!document.querySelector(sel), selector);
 }
 
-// ============================================
-// DIAGNOSTICS
-// Dump the scraper's-eye view from every angle into the key-value store so we
-// can see exactly what CarGurus served the bot: a screenshot, the raw HTML,
-// which filter elements actually rendered, automation tells (webdriver etc.),
-// and any bot-wall vendor fingerprints (cookies / HTML signatures). Each call
-// writes diag-<label>-<time>.{png,html,json} and logs a one-line summary.
-// ============================================
-async function captureDiagnostics(page, label) {
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const key = `diag-${label}-${stamp}`;
-    const summary = { label, timestamp: new Date().toISOString() };
-
-    try {
-        try {
-            await Actor.setValue(`${key}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
-        } catch (e) { summary.screenshotError = e.message; }
-
-        try {
-            const html = await page.content();
-            await Actor.setValue(`${key}.html`, html, { contentType: 'text/html; charset=utf-8' });
-            summary.htmlLength = html.length;
-            const hay = html.toLowerCase();
-            summary.botSignals = [
-                'pardon our interruption', 'distil', 'imperva', 'datadome', 'perimeterx',
-                'px-captcha', 'access denied', 'unusual traffic', 'are you a human',
-                'captcha', 'cf-challenge', 'cloudflare', 'akamai', 'bot detection',
-                'verify you are human', 'enable javascript and cookies', 'request unsuccessful',
-            ].filter((s) => hay.includes(s));
-        } catch (e) { summary.htmlError = e.message; }
-
-        try {
-            const cookieNames = (await page.context().cookies()).map((c) => c.name);
-            summary.cookieCount = cookieNames.length;
-            summary.botVendors = [];
-            if (cookieNames.some((n) => /^visid_incap|^incap_ses|^nlbi_/.test(n))) summary.botVendors.push('Imperva/Incapsula');
-            if (cookieNames.some((n) => n === 'datadome')) summary.botVendors.push('DataDome');
-            if (cookieNames.some((n) => /^_px|^pxvid/.test(n))) summary.botVendors.push('PerimeterX/HUMAN');
-            if (cookieNames.some((n) => /^__cf_bm|^cf_clearance/.test(n))) summary.botVendors.push('Cloudflare');
-            if (cookieNames.some((n) => /^ak_bmsc|^bm_sz|^_abck/.test(n))) summary.botVendors.push('Akamai');
-            summary.cookieNames = cookieNames;
-        } catch (e) { summary.cookieError = e.message; }
-
-        try {
-            const env = await page.evaluate(() => {
-                const q = (sel) => document.querySelectorAll(sel).length;
-                let webgl = {};
-                try {
-                    const gl = document.createElement('canvas').getContext('webgl');
-                    const dbg = gl && gl.getExtension('WEBGL_debug_renderer_info');
-                    if (dbg) webgl = { vendor: gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL), renderer: gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) };
-                } catch (_) {}
-                return {
-                    url: location.href,
-                    title: document.title,
-                    webdriver: navigator.webdriver,
-                    userAgent: navigator.userAgent,
-                    languages: navigator.languages,
-                    platform: navigator.platform,
-                    pluginsCount: navigator.plugins ? navigator.plugins.length : 0,
-                    hardwareConcurrency: navigator.hardwareConcurrency,
-                    deviceMemory: navigator.deviceMemory,
-                    innerSize: `${window.innerWidth}x${window.innerHeight}`,
-                    webgl,
-                    elements: {
-                        distanceSelect: q('select[aria-label="Distance from me"]'),
-                        bodyStyleTrigger: q('#BodyStyle-accordion-trigger'),
-                        bodyStyleContent: q('#BodyStyle-accordion-content'),
-                        bodyCheckboxes: q('button[role="checkbox"][id^="FILTER.BODY_TYPE_GROUP."]'),
-                        makeCheckboxes: q('button[role="checkbox"][id^="FILTER.MAKE_MODEL."]'),
-                        makeTrigger: q('#MakeAndModel-accordion-trigger'),
-                    },
-                };
-            });
-            Object.assign(summary, env);
-        } catch (e) { summary.envError = e.message; }
-
-        await Actor.setValue(`${key}.json`, summary, { contentType: 'application/json' });
-
-        const el = summary.elements || {};
-        console.log(`🔬 [diag:${label}] url=${summary.url || '?'} title=${JSON.stringify(summary.title || '')}`);
-        console.log(`🔬 [diag:${label}] webdriver=${summary.webdriver} plugins=${summary.pluginsCount} webgl=${JSON.stringify(summary.webgl || {})}`);
-        console.log(`🔬 [diag:${label}] elements: distance=${el.distanceSelect} bodyTrigger=${el.bodyStyleTrigger} bodyContent=${el.bodyStyleContent} bodyCbx=${el.bodyCheckboxes} makeCbx=${el.makeCheckboxes}`);
-        console.log(`🔬 [diag:${label}] botVendors=${JSON.stringify(summary.botVendors || [])} botSignals=${JSON.stringify(summary.botSignals || [])} → saved ${key}.{png,html,json}`);
-    } catch (e) {
-        console.log(`🔬 [diag:${label}] capture failed: ${e.message}`);
-    }
-
-    return summary;
-}
-
 async function clickInPage(page, selector) {
     return page.evaluate((sel) => {
         const el = document.querySelector(sel);
@@ -568,8 +477,97 @@ async function applyDealRatingFilter(page, dealRatings) {
 // MAIN SCRAPER
 // ============================================
 
+// ============================================
+// DIAGNOSTICS
+// Capture what the SCRAPER actually sees — from every angle — so we can tell
+// whether CarGurus is serving us a broken/bot-mitigated page vs the smooth
+// one a human gets. Saves a screenshot + full HTML + a structured signals
+// JSON to the default key-value store, and prints an at-a-glance summary.
+// ============================================
+async function captureDiagnostics(page, label) {
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const tag = `diag-${label}-${ts}`;
+
+    let signals = {};
+    try {
+        signals = await page.evaluate(() => {
+            const html = document.documentElement.outerHTML;
+            const bodyText = document.body ? (document.body.innerText || '') : '';
+            const has = (re) => re.test(html);
+            return {
+                url: location.href,
+                title: document.title,
+                readyState: document.readyState,
+                webdriver: navigator.webdriver,
+                userAgent: navigator.userAgent,
+                languages: navigator.languages,
+                pluginCount: navigator.plugins ? navigator.plugins.length : 0,
+                htmlLength: html.length,
+                bodyTextLength: bodyText.length,
+                // Did the filter panel actually render?
+                distanceSelect: !!document.querySelector('select[aria-label="Distance from me"], select[data-testid="select-filter-distance"]'),
+                bodyTrigger: !!document.querySelector('#BodyStyle-accordion-trigger'),
+                bodyContentState: (document.querySelector('#BodyStyle-accordion-content') || {}).getAttribute
+                    ? document.querySelector('#BodyStyle-accordion-content').getAttribute('data-state') : null,
+                bodyCheckboxes: document.querySelectorAll('button[role="checkbox"][id^="FILTER.BODY_TYPE_GROUP."]').length,
+                makeCheckboxes: document.querySelectorAll('button[role="checkbox"][id^="FILTER.MAKE_MODEL."]').length,
+                accordionTriggers: Array.from(document.querySelectorAll('[id$="-accordion-trigger"]')).map((e) => e.id),
+                filterButtons: Array.from(document.querySelectorAll('button'))
+                    .map((b) => (b.textContent || '').trim())
+                    .filter((t) => /^filters?$/i.test(t) || /show filters|all filters/i.test(t))
+                    .slice(0, 5),
+                // Bot-wall / challenge fingerprints in the served HTML/text
+                datadome: has(/datadome/i),
+                perimeterx: has(/perimeterx|px-captcha|_pxhd|window\._px/i),
+                cloudflare: has(/cf-challenge|cf_chl|challenge-platform|cf-turnstile/i),
+                akamai: has(/ak_bmsc|akam|_abck/i),
+                recaptcha: has(/recaptcha/i),
+                hcaptcha: has(/hcaptcha/i),
+                challengeText: /unusual traffic|are you a robot|verify (you|your)|access (to this page has been )?denied|you have been blocked|captcha|pardon our interruption|before we continue|checking your browser/i.test(bodyText),
+                bodyTextSample: bodyText.replace(/\s+/g, ' ').trim().slice(0, 600),
+            };
+        });
+    } catch (e) {
+        signals = { error: `page.evaluate failed: ${e.message}` };
+    }
+
+    // httpOnly bot cookies (datadome/_abck/px…) aren't in document.cookie — read
+    // them from the browser context instead.
+    try {
+        const names = (await page.context().cookies()).map((c) => c.name);
+        signals.cookieNames = names;
+        signals.botCookies = names.filter((n) => /datadome|_abck|ak_bmsc|_px|px[_-]|__cf|cf_|incap_|visid|reese84/i.test(n));
+    } catch (_) {}
+
+    // Persist the three artifacts.
+    try {
+        await Actor.setValue(`${tag}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
+    } catch (e) { console.log(`  ⚠️ diag screenshot failed: ${e.message}`); }
+    try {
+        await Actor.setValue(`${tag}.html`, await page.content(), { contentType: 'text/html; charset=utf-8' });
+    } catch (e) { console.log(`  ⚠️ diag html failed: ${e.message}`); }
+    try {
+        await Actor.setValue(`${tag}.json`, signals, { contentType: 'application/json' });
+    } catch (e) { console.log(`  ⚠️ diag json failed: ${e.message}`); }
+
+    // At-a-glance console verdict.
+    console.log(`  🔬 DIAG [${label}] → saved ${tag}.png / .html / .json`);
+    console.log(`     url=${signals.url}`);
+    console.log(`     title="${signals.title}" ready=${signals.readyState} webdriver=${signals.webdriver} htmlLen=${signals.htmlLength} bodyTextLen=${signals.bodyTextLength}`);
+    console.log(`     panel: distanceSelect=${signals.distanceSelect} bodyTrigger=${signals.bodyTrigger} bodyContentState=${signals.bodyContentState} bodyCheckboxes=${signals.bodyCheckboxes} makeCheckboxes=${signals.makeCheckboxes}`);
+    console.log(`     accordions=${JSON.stringify(signals.accordionTriggers)} filterButtons=${JSON.stringify(signals.filterButtons)}`);
+    console.log(`     bot: challengeText=${signals.challengeText} datadome=${signals.datadome} px=${signals.perimeterx} cf=${signals.cloudflare} akamai=${signals.akamai} recaptcha=${signals.recaptcha} hcaptcha=${signals.hcaptcha}`);
+    console.log(`     botCookies=${JSON.stringify(signals.botCookies || [])}`);
+    if (signals.challengeText || signals.bodyTrigger === false) {
+        console.log(`     ⚠️ bodyTextSample: ${JSON.stringify(signals.bodyTextSample)}`);
+    }
+    return signals;
+}
+
 await Actor.main(async () => {
     const input = await Actor.getInput();
+    // Diagnostics are ON unless the run input explicitly sets debug:false.
+    const debug = !input || input.debug !== false;
 
     const {
         searchRadius = 50000,
@@ -676,15 +674,7 @@ await Actor.main(async () => {
         try {
             console.log(`\n🌐 Visiting base page: ${baseUrl}`);
             const navResponse = await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
-
-            // Raw HTTP response + bot-vendor fingerprints (headers / cookies)
-            try {
-                const status = navResponse ? navResponse.status() : 'n/a';
-                const headers = navResponse ? await navResponse.allHeaders() : {};
-                const cookieNames = (await context.cookies()).map((c) => c.name);
-                console.log(`🌐 HTTP ${status} | server=${headers.server || '-'} via=${headers.via || '-'} cf-ray=${headers['cf-ray'] || '-'} x-datadome=${headers['x-datadome'] || '-'}`);
-                console.log(`🍪 cookies (${cookieNames.length}): ${cookieNames.join(', ') || '(none)'}`);
-            } catch (_) {}
+            console.log(`  🌐 HTTP status: ${navResponse ? navResponse.status() : 'n/a'} (final URL: ${page.url()})`);
 
             console.log('⏳ Waiting for page to load...');
             await page.waitForTimeout(5000);
@@ -695,24 +685,25 @@ await Actor.main(async () => {
             await page.mouse.move(300, 400);
             await page.waitForTimeout(1000);
 
-            // Baseline: what does the scraper actually see on a fresh load?
-            if (filterAttempt === 1) {
-                await captureDiagnostics(page, `attempt${filterAttempt}-afterload`);
-            }
+            // Baseline: capture exactly what the scraper sees on arrival, every
+            // attempt, so we can compare a good load vs a bad one.
+            if (debug) await captureDiagnostics(page, `attempt${filterAttempt}-postload`);
 
             const result = await applyFilters(page, filters, searchRadius);
 
             if (result) {
                 filtersSucceeded = true;
-                await captureDiagnostics(page, `attempt${filterAttempt}-success`);
                 break;
             }
 
-            // Filters failed, browser still open — capture the exact failure state.
-            await captureDiagnostics(page, `attempt${filterAttempt}-filterfail`);
+            // Filters failed — snapshot the exact failed state (which step failed
+            // is visible in the log lines just above this).
+            if (debug) await captureDiagnostics(page, `attempt${filterAttempt}-FAILED`);
         } catch (e) {
             console.log(`  ❌ Browser attempt ${filterAttempt} crashed: ${e.message}`);
-            try { await captureDiagnostics(page, `attempt${filterAttempt}-crash`); } catch (_) {}
+            if (debug) {
+                try { await captureDiagnostics(page, `attempt${filterAttempt}-CRASH`); } catch (_) {}
+            }
         }
 
         if (filterAttempt < 3) {
