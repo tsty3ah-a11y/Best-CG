@@ -25,32 +25,66 @@ async function applyFilters(page, filters, searchRadius) {
     return true;
 }
 
+async function settleAfterFilterChange(page) {
+    // Each filter change reloads results and re-renders the panel. This is an
+    // ad-heavy SPA where 'networkidle' NEVER fires (the side-rail ad keeps
+    // polling), so we just debounce a fixed amount instead of waiting on it.
+    await page.waitForTimeout(2500);
+}
+
+// Read a DOM attribute fresh, in-page — never uses a stale element handle, so it
+// survives the panel re-rendering between calls.
+async function getAttr(page, selector, attr) {
+    return page.evaluate(([sel, a]) => {
+        const el = document.querySelector(sel);
+        return el ? el.getAttribute(a) : null;
+    }, [selector, attr]).catch(() => null);
+}
+
+// Native in-page click: re-queries the element at click time (so it can't go
+// stale mid-re-render) and fires a real click event that React/Radix respond to.
+// This is far more reliable than Playwright's scroll+actionability click on this
+// constantly-re-rendering filter panel. Returns false if the element isn't there.
+async function jsClick(page, selector) {
+    return page.evaluate((sel) => {
+        const el = document.querySelector(sel);
+        if (!el) return false;
+        el.scrollIntoView({ block: 'center', inline: 'nearest' });
+        el.click();
+        return true;
+    }, selector).catch(() => false);
+}
+
 async function ensureAccordionOpen(page, triggerSelector, contentSelector, name) {
-    const trigger = page.locator(triggerSelector).first();
-    const content = page.locator(contentSelector).first();
+    // Body Style / Deal Rating etc. now sit far down a long, re-rendering list.
+    // Poll+JS-click the trigger by its stable id until aria-expanded / data-state
+    // reports open, re-querying fresh every attempt.
+    await page.waitForSelector(triggerSelector, { state: 'attached', timeout: 30000 });
 
-    await trigger.waitFor({ state: 'visible', timeout: 90000 });
-
-    for (let attempt = 1; attempt <= 3; attempt++) {
-        const triggerExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
-        const contentState = await content.getAttribute('data-state').catch(() => null);
-
-        if (triggerExpanded === 'true' || contentState === 'open') {
+    for (let attempt = 1; attempt <= 6; attempt++) {
+        const expanded = await getAttr(page, triggerSelector, 'aria-expanded');
+        const state = await getAttr(page, contentSelector, 'data-state');
+        if (expanded === 'true' || state === 'open') {
             console.log(`  ✅ ${name} accordion is open`);
             return true;
         }
 
-        await trigger.scrollIntoViewIfNeeded({ timeout: 10000 });
-        await trigger.click({ timeout: 10000, force: true });
-        await page.waitForTimeout(800);
+        const clicked = await jsClick(page, triggerSelector);
+        if (!clicked) {
+            // Trigger momentarily gone during a re-render — wait and retry fresh.
+            await page.waitForTimeout(1000);
+            continue;
+        }
+        await page.waitForTimeout(900);
 
-        const updatedExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
-        const updatedContentState = await content.getAttribute('data-state').catch(() => null);
-
-        if (updatedExpanded === 'true' || updatedContentState === 'open') {
+        const expanded2 = await getAttr(page, triggerSelector, 'aria-expanded');
+        const state2 = await getAttr(page, contentSelector, 'data-state');
+        if (expanded2 === 'true' || state2 === 'open') {
             console.log(`  ✅ Opened ${name} accordion`);
             return true;
         }
+        console.log(`  ↻ ${name} accordion not open yet, retry ${attempt}/6...`);
+        await page.waitForTimeout(700);
     }
 
     throw new Error(`${name} accordion did not open`);
@@ -141,15 +175,22 @@ async function setSearchRadius(page, searchRadius) {
         }
 
         await dropdown.selectOption(optionValue, { timeout: 90000 });
-        await page.waitForTimeout(2000);
 
-        const selectedValue = await dropdown.inputValue();
+        // Selecting the radius reloads results and detaches this <select>. Wait for
+        // the reload to settle, then verify against a FRESH locator — reading
+        // inputValue() off the stale one is what used to hang for 30s and fail.
+        await settleAfterFilterChange(page);
 
-        if (selectedValue !== optionValue) {
+        const freshDropdown = await findDistanceDropdown(page);
+        const selectedValue = freshDropdown
+            ? await freshDropdown.inputValue({ timeout: 10000 }).catch(() => null)
+            : null;
+
+        if (selectedValue && selectedValue !== optionValue) {
             throw new Error(`Distance dropdown value mismatch. Expected ${optionValue}, got ${selectedValue}`);
         }
 
-        console.log(`  ✅ Search radius set successfully: ${selectedValue}`);
+        console.log(`  ✅ Search radius set successfully: ${selectedValue || optionValue}`);
         return true;
 
     } catch (error) {
@@ -174,27 +215,37 @@ async function applyBodyTypeFilter(page, bodyTypes) {
         await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
 
         const clickCheckboxByAriaLabelContains = async (groupName, labelText) => {
-            const checkbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
+            const selector = `button[role="checkbox"][aria-label*="${labelText}"]`;
 
-            await checkbox.waitFor({ state: 'attached', timeout: 90000 });
-            await checkbox.scrollIntoViewIfNeeded({ timeout: 10000 });
+            for (let attempt = 1; attempt <= 5; attempt++) {
+                // A prior checkbox click reloads results and may collapse the panel,
+                // so re-open the accordion and re-query the checkbox fresh each pass.
+                await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
+                await page.waitForSelector(selector, { state: 'attached', timeout: 30000 }).catch(() => {});
 
-            const checkedBefore = await checkbox.getAttribute('aria-checked');
-            if (checkedBefore === 'true') {
-                console.log(`  ✅ ${groupName}: ${labelText} already selected`);
-                return true;
+                const before = await getAttr(page, selector, 'aria-checked');
+                if (before === 'true') {
+                    console.log(`  ✅ ${groupName}: ${labelText} already selected`);
+                    return true;
+                }
+
+                const clicked = await jsClick(page, selector);
+                if (!clicked) {
+                    await page.waitForTimeout(1000);
+                    continue;
+                }
+                await page.waitForTimeout(1200);
+
+                const after = await getAttr(page, selector, 'aria-checked');
+                if (after === 'true') {
+                    console.log(`  ✅ ${groupName}: Added ${labelText}`);
+                    return true;
+                }
+                console.log(`  ↻ ${groupName}: ${labelText} not checked yet (state ${after}), retry ${attempt}/5...`);
+                await page.waitForTimeout(800);
             }
 
-            await checkbox.click({ timeout: 30000, force: true });
-            await page.waitForTimeout(700);
-
-            const checkedAfter = await checkbox.getAttribute('aria-checked');
-            if (checkedAfter !== 'true') {
-                throw new Error(`${groupName}: clicked ${labelText}, but aria-checked is ${checkedAfter}`);
-            }
-
-            console.log(`  ✅ ${groupName}: Added ${labelText}`);
-            return true;
+            throw new Error(`${groupName}: could not select ${labelText} after retries`);
         };
 
         for (const bodyType of bodyTypes) {
@@ -236,46 +287,41 @@ function normalizeMakeName(make) {
 async function clickMakeCheckbox(page, make) {
     const normalizedMake = normalizeMakeName(make);
 
-    const selectors = [
-        `button[data-testid="checkbox-FILTER.MAKE_MODEL.${normalizedMake}"]`,
-        `button[data-cg-ft="checkbox-FILTER.MAKE_MODEL.${normalizedMake}"]`,
-        `button[id="FILTER.MAKE_MODEL.${normalizedMake}"]`,
+    // The checkbox we verify against, by its stable id.
+    const idSelector = `[id="FILTER.MAKE_MODEL.${normalizedMake}"]`;
+    // Selectors we'll try to click (id + data attrs + aria-label variants).
+    const clickSelectors = [
+        `[data-testid="checkbox-FILTER.MAKE_MODEL.${normalizedMake}"]`,
+        `[data-cg-ft="checkbox-FILTER.MAKE_MODEL.${normalizedMake}"]`,
+        idSelector,
         `button[role="checkbox"][aria-label="${make}"]`,
         `button[role="checkbox"][aria-label="${normalizedMake}"]`,
-        `label:has-text("${make}")`,
-        `label:has-text("${normalizedMake}")`,
     ];
 
-    for (const selector of selectors) {
-        const locator = page.locator(selector).first();
-
-        try {
-            await locator.waitFor({ state: 'attached', timeout: 3000 });
-            await locator.scrollIntoViewIfNeeded({ timeout: 5000 });
-            await page.waitForTimeout(300);
-
-            const checkbox = page.locator(`button[role="checkbox"][id="FILTER.MAKE_MODEL.${normalizedMake}"]`).first();
-            const checkedBefore = await checkbox.getAttribute('aria-checked').catch(() => null);
-
-            if (checkedBefore === 'true') {
-                console.log(`  ✅ ${make} already selected`);
-                return true;
-            }
-
-            await locator.click({ timeout: 10000, force: true });
-            await page.waitForTimeout(700);
-
-            const checkedAfter = await checkbox.getAttribute('aria-checked').catch(() => null);
-
-            if (checkedAfter === 'true') {
-                console.log(`  ✅ Added ${make} using selector: ${selector}`);
-                return true;
-            }
-
-            console.log(`  ⚠️ Clicked ${make}, but checkbox state is still: ${checkedAfter}`);
-        } catch (_) {
-            // Try next selector
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        const before = await getAttr(page, idSelector, 'aria-checked');
+        if (before === 'true') {
+            console.log(`  ✅ ${make} already selected`);
+            return true;
         }
+
+        let clicked = false;
+        for (const sel of clickSelectors) {
+            clicked = await jsClick(page, sel);
+            if (clicked) break;
+        }
+        if (!clicked) {
+            await page.waitForTimeout(800);
+            continue;
+        }
+        await page.waitForTimeout(900);
+
+        const after = await getAttr(page, idSelector, 'aria-checked');
+        if (after === 'true') {
+            console.log(`  ✅ Added ${make}`);
+            return true;
+        }
+        console.log(`  ↻ ${make} not checked yet (state ${after}), retry ${attempt}/3...`);
     }
 
     return false;
@@ -287,15 +333,22 @@ async function applyMakeFilter(page, makes) {
 
         await ensureAccordionOpen(page, '#MakeAndModel-accordion-trigger', '#MakeAndModel-accordion-content', 'Make & Model');
 
-        const showAllMakesButton = page.locator('button:has-text("Show all makes")').first();
-        if (await showAllMakesButton.isVisible().catch(() => false)) {
-            await showAllMakesButton.click({ timeout: 5000 });
-            await page.waitForTimeout(1000);
+        // Expand the full make list ("Show all makes" has no stable id — match text).
+        const expandedAll = await page.evaluate(() => {
+            const btn = Array.from(document.querySelectorAll('button'))
+                .find((b) => b.textContent.trim() === 'Show all makes');
+            if (!btn) return false;
+            btn.scrollIntoView({ block: 'center' });
+            btn.click();
+            return true;
+        }).catch(() => false);
+        if (expandedAll) {
             console.log('  ✅ Expanded make list');
+            await page.waitForTimeout(1000);
         }
 
-        await page.locator('#FILTER\\.MAKE_MODEL, ul[id="FILTER.MAKE_MODEL"]').first()
-            .waitFor({ state: 'visible', timeout: 90000 });
+        await page.waitForSelector('[id="FILTER.MAKE_MODEL"]', { state: 'attached', timeout: 30000 })
+            .catch(() => {});
 
         for (const make of makes) {
             const success = await clickMakeCheckbox(page, make);
@@ -369,15 +422,30 @@ async function applyDealRatingFilter(page, dealRatings) {
 
         await ensureAccordionOpen(page, '#DealRating-accordion-trigger', '#DealRating-accordion-content', 'Deal Rating');
 
-        // Click checkboxes for each deal rating
+        // Click checkboxes for each deal rating (JS-click + poll aria-checked).
         for (const rating of dealRatings) {
-            try {
-                // Click with 6-minute timeout
-                await page.click(`#FILTER\\.DEAL_RATING\\.${rating}`, { timeout: 90000 });
+            const selector = `[id="FILTER.DEAL_RATING.${rating}"]`;
+            let done = false;
+
+            for (let attempt = 1; attempt <= 4; attempt++) {
+                await page.waitForSelector(selector, { state: 'attached', timeout: 30000 }).catch(() => {});
+
+                const before = await getAttr(page, selector, 'aria-checked');
+                if (before === 'true') { done = true; break; }
+
+                const clicked = await jsClick(page, selector);
+                if (!clicked) { await page.waitForTimeout(800); continue; }
+                await page.waitForTimeout(900);
+
+                const after = await getAttr(page, selector, 'aria-checked');
+                if (after === 'true') { done = true; break; }
+                console.log(`  ↻ ${rating} not checked yet (state ${after}), retry ${attempt}/4...`);
+            }
+
+            if (done) {
                 console.log(`  ✅ Added ${rating.replace('_', ' ')}`);
-                await page.waitForTimeout(300);
-            } catch (error) {
-                console.log(`  ❌ Could not click ${rating}: ${error.message}`);
+            } else {
+                console.log(`  ❌ Could not select ${rating}`);
                 return false;
             }
         }
