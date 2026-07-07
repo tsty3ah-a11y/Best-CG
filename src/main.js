@@ -41,15 +41,24 @@ async function getAttr(page, selector, attr) {
     }, [selector, attr]).catch(() => null);
 }
 
-// Native in-page click: re-queries the element at click time (so it can't go
-// stale mid-re-render) and fires a real click event that React/Radix respond to.
-// This is far more reliable than Playwright's scroll+actionability click on this
-// constantly-re-rendering filter panel. Returns false if the element isn't there.
+// In-page click: re-queries the element at click time (so it can't go stale
+// mid-re-render) and fires the FULL pointer→mouse→click gesture Radix listens
+// for — a bare .click() is sometimes ignored by Radix controls in headless.
+// Radix toggles on `click` only (not pointer/mouse), so this still toggles once.
+// Returns false if the element is missing or disabled.
 async function jsClick(page, selector) {
     return page.evaluate((sel) => {
         const el = document.querySelector(sel);
         if (!el) return false;
+        if (el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
         el.scrollIntoView({ block: 'center', inline: 'nearest' });
+        const o = { bubbles: true, cancelable: true, view: window };
+        try {
+            el.dispatchEvent(new PointerEvent('pointerdown', o));
+            el.dispatchEvent(new MouseEvent('mousedown', o));
+            el.dispatchEvent(new PointerEvent('pointerup', o));
+            el.dispatchEvent(new MouseEvent('mouseup', o));
+        } catch (_) {}
         el.click();
         return true;
     }, selector).catch(() => false);
@@ -208,54 +217,64 @@ async function setSearchRadius(page, searchRadius) {
     }
 }
 
+// Body Style checkboxes have stable ids FILTER.BODY_TYPE_GROUP.<n> (decoded from
+// the live DOM). aria-label carries a live count suffix e.g. "SUV / Crossover
+// (1,152)", so we target the id and only use the label as a fallback.
+const BODY_TYPE_GROUP_IDS = {
+    coupe: 0, convertible: 1, hatchback: 3, minivan: 4,
+    'pickup truck': 5, pickup: 5, sedan: 6,
+    'suv / crossover': 7, suv: 7, crossover: 7, van: 8, wagon: 9,
+};
+
 async function applyBodyTypeFilter(page, bodyTypes) {
     try {
         console.log(`🚗 Setting body types: ${bodyTypes.join(', ')}`);
 
         await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
 
-        const clickCheckboxByAriaLabelContains = async (groupName, labelText) => {
-            const selector = `button[role="checkbox"][aria-label*="${labelText}"]`;
+        const clickBodyType = async (label, groupId) => {
+            const idSel = `[id="FILTER.BODY_TYPE_GROUP.${groupId}"]`;
+            const labelSel = `button[role="checkbox"][aria-label*="${label}"]`;
 
             for (let attempt = 1; attempt <= 5; attempt++) {
                 // A prior checkbox click reloads results and may collapse the panel,
                 // so re-open the accordion and re-query the checkbox fresh each pass.
                 await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
-                await page.waitForSelector(selector, { state: 'attached', timeout: 30000 }).catch(() => {});
+                await page.waitForSelector(idSel, { state: 'attached', timeout: 30000 }).catch(() => {});
 
-                const before = await getAttr(page, selector, 'aria-checked');
+                const before = await getAttr(page, idSel, 'aria-checked');
                 if (before === 'true') {
-                    console.log(`  ✅ ${groupName}: ${labelText} already selected`);
+                    console.log(`  ✅ Body type: ${label} already selected`);
                     return true;
                 }
 
-                const clicked = await jsClick(page, selector);
+                let clicked = await jsClick(page, idSel);
+                if (!clicked) clicked = await jsClick(page, labelSel);
                 if (!clicked) {
                     await page.waitForTimeout(1000);
                     continue;
                 }
                 await page.waitForTimeout(1200);
 
-                const after = await getAttr(page, selector, 'aria-checked');
+                const after = await getAttr(page, idSel, 'aria-checked');
                 if (after === 'true') {
-                    console.log(`  ✅ ${groupName}: Added ${labelText}`);
+                    console.log(`  ✅ Body type: Added ${label}`);
                     return true;
                 }
-                console.log(`  ↻ ${groupName}: ${labelText} not checked yet (state ${after}), retry ${attempt}/5...`);
+                console.log(`  ↻ Body type: ${label} not checked yet (state ${after}), retry ${attempt}/5...`);
                 await page.waitForTimeout(800);
             }
 
-            throw new Error(`${groupName}: could not select ${labelText} after retries`);
+            throw new Error(`Body type: could not select ${label} after retries`);
         };
 
         for (const bodyType of bodyTypes) {
-            if (bodyType.includes('SUV')) {
-                await clickCheckboxByAriaLabelContains('Body type', 'SUV / Crossover');
+            const groupId = BODY_TYPE_GROUP_IDS[bodyType.trim().toLowerCase()];
+            if (groupId === undefined) {
+                console.log(`  ⚠️ Unknown body type "${bodyType}" — skipping`);
+                continue;
             }
-
-            if (bodyType.includes('Pickup')) {
-                await clickCheckboxByAriaLabelContains('Body type', 'Pickup Truck');
-            }
+            await clickBodyType(bodyType, groupId);
         }
 
         await page.waitForTimeout(2000);
