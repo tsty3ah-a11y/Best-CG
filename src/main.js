@@ -547,7 +547,9 @@ async function captureDiagnostics(page, label) {
         await Actor.setValue(`${tag}.html`, await page.content(), { contentType: 'text/html; charset=utf-8' });
     } catch (e) { console.log(`  ⚠️ diag html failed: ${e.message}`); }
     try {
-        await Actor.setValue(`${tag}.json`, signals, { contentType: 'application/json' });
+        // No contentType: Actor.setValue auto-serializes a plain object to JSON.
+        // (Passing contentType requires a String/Buffer, which is why it errored.)
+        await Actor.setValue(`${tag}.json`, signals);
     } catch (e) { console.log(`  ⚠️ diag json failed: ${e.message}`); }
 
     // At-a-glance console verdict.
@@ -568,6 +570,16 @@ await Actor.main(async () => {
     const input = await Actor.getInput();
     // Diagnostics are ON unless the run input explicitly sets debug:false.
     const debug = !input || input.debug !== false;
+
+    // Wire the Apify proxy from input into the ACTUAL browser. It was defined in
+    // input all along but never applied in code, so every request egressed from
+    // Apify's data-center IP — which CarGurus geolocated to the US (zip 20149 /
+    // Ashburn VA) and answered with a 0-results "Error" page on the .ca search.
+    // A residential CA IP gives a Canadian zip and real inventory.
+    const proxyConfiguration = await Actor.createProxyConfiguration(input?.proxyConfiguration);
+    console.log(proxyConfiguration
+        ? `🛡️ Proxy configured: ${JSON.stringify(input.proxyConfiguration)}`
+        : '⚠️ No proxy configured — egressing on the actor\'s direct (data-center) IP');
 
     const {
         searchRadius = 50000,
@@ -650,8 +662,24 @@ await Actor.main(async () => {
 
         console.log(`\n🔄 Starting fresh browser (attempt ${filterAttempt}/3)...`);
 
+        // Fresh residential IP each attempt (new proxy session) so one bad exit
+        // node doesn't sink all three tries.
+        let launchProxy;
+        if (proxyConfiguration) {
+            const sessionId = `cg${Date.now().toString(36)}${filterAttempt}`;
+            const proxyUrl = await proxyConfiguration.newUrl(sessionId);
+            const u = new URL(proxyUrl);
+            launchProxy = {
+                server: `${u.protocol}//${u.host}`,
+                username: decodeURIComponent(u.username),
+                password: decodeURIComponent(u.password),
+            };
+            console.log(`  🛡️ Proxy for this attempt: ${u.host} (session ${sessionId})`);
+        }
+
         browser = await chromium.launch({
             headless: true,
+            proxy: launchProxy,
             args: [
                 '--disable-blink-features=AutomationControlled',
                 '--disable-features=IsolateOrigins,site-per-process',
@@ -670,6 +698,16 @@ await Actor.main(async () => {
         });
 
         page = await context.newPage();
+
+        // Prove the egress IP/geo actually changed — this is the smoking-gun
+        // check. Want to see a Canadian city here, not Ashburn/Virginia/US.
+        try {
+            const ipResp = await context.request.get('https://ipinfo.io/json', { timeout: 10000 });
+            const ip = await ipResp.json();
+            console.log(`  🌍 Egress IP: ${ip.ip} — ${ip.city || '?'}, ${ip.region || '?'}, ${ip.country || '?'}`);
+        } catch (e) {
+            console.log(`  ⚠️ Egress IP check failed: ${e.message}`);
+        }
 
         try {
             console.log(`\n🌐 Visiting base page: ${baseUrl}`);
