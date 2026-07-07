@@ -35,8 +35,16 @@ async function applyFilters(page, filters, searchRadius) {
 // never click twice and toggle a control back off.
 // ============================================
 
-async function waitForSelectorAttached(page, selector, timeout = 90000) {
+// Short default on purpose: the filter accordions are lazy React components
+// that sometimes never render on a bad page load. Failing in ~20s lets the
+// outer 3-attempt loop restart with a fresh browser instead of hanging 90s.
+async function waitForSelectorAttached(page, selector, timeout = 20000) {
     await page.locator(selector).first().waitFor({ state: 'attached', timeout });
+}
+
+// True if the selector currently matches an element in the live DOM.
+async function isPresent(page, selector) {
+    return page.evaluate((sel) => !!document.querySelector(sel), selector);
 }
 
 async function clickInPage(page, selector) {
@@ -220,41 +228,63 @@ async function applyBodyTypeFilter(page, bodyTypes) {
     try {
         console.log(`🚗 Setting body types: ${bodyTypes.join(', ')}`);
 
-        await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
+        const trigger = '#BodyStyle-accordion-trigger';
+        const content = '#BodyStyle-accordion-content';
 
-        // CarGurus now renders a live listing count inside each option's aria-label
-        // (e.g. "SUV / Crossover (9,140)"). Those counts recompute whenever another
-        // filter changes, remounting the checkbox nodes — so any action that waits
-        // for the element to be "stable" (scrollIntoViewIfNeeded) loses it mid-flight
-        // with "not attached to the DOM". Match by aria-label prefix, read state via
-        // a detach-proof querySelector, and click a freshly-resolved locator on retry.
-        const clickCheckboxByAriaLabelContains = async (groupName, labelText) => {
+        // Gate: confirm the Body Style panel actually rendered on this load.
+        // If it never attaches, this page/variant is bad — fail fast so the
+        // outer loop restarts with a fresh browser instead of hanging.
+        try {
+            await waitForSelectorAttached(page, trigger, 20000);
+        } catch (_) {
+            throw new Error('Body Style panel did not render (bad page load)');
+        }
+
+        const wanted = [];
+        for (const bodyType of bodyTypes) {
+            if (bodyType.includes('SUV')) wanted.push('SUV / Crossover');
+            if (bodyType.includes('Pickup')) wanted.push('Pickup Truck');
+        }
+
+        // CarGurus' live listing counts re-render the whole panel, which can
+        // re-COLLAPSE the accordion and unmount its checkboxes. So for each
+        // body type we retry a full round: (re)open the accordion, wait for the
+        // checkbox to exist, click it in-page, then verify — up to N rounds.
+        for (const labelText of wanted) {
             const selector = `button[role="checkbox"][aria-label^="${labelText}"]`;
             const isChecked = async () => (await readAttr(page, selector, 'aria-checked')) === 'true';
 
-            await waitForSelectorAttached(page, selector);
-
             if (await isChecked()) {
-                console.log(`  ✅ ${groupName}: ${labelText} already selected`);
-                return true;
+                console.log(`  ✅ Body type: ${labelText} already selected`);
+                continue;
             }
 
-            if (await clickUntilState(page, selector, isChecked)) {
-                console.log(`  ✅ ${groupName}: Added ${labelText}`);
-                return true;
+            let done = false;
+            for (let round = 1; round <= 10 && !done; round++) {
+                try {
+                    await ensureAccordionOpen(page, trigger, content, 'Body Style');
+                } catch (_) {
+                    await page.waitForTimeout(1000);
+                    continue;
+                }
+
+                if (await isChecked()) { done = true; break; }
+
+                // Checkbox not in the DOM yet (accordion just opened / mid-render)?
+                if (!(await isPresent(page, selector))) {
+                    await page.waitForTimeout(1000);
+                    continue;
+                }
+
+                await clickInPage(page, selector);
+                for (let i = 0; i < 8; i++) {
+                    await page.waitForTimeout(250);
+                    if (await isChecked()) { done = true; break; }
+                }
             }
 
-            throw new Error(`${groupName}: clicked ${labelText}, but aria-checked never became true`);
-        };
-
-        for (const bodyType of bodyTypes) {
-            if (bodyType.includes('SUV')) {
-                await clickCheckboxByAriaLabelContains('Body type', 'SUV / Crossover');
-            }
-
-            if (bodyType.includes('Pickup')) {
-                await clickCheckboxByAriaLabelContains('Body type', 'Pickup Truck');
-            }
+            if (!done) throw new Error(`could not select ${labelText} after retries`);
+            console.log(`  ✅ Body type: Added ${labelText}`);
         }
 
         await page.waitForTimeout(2000);
