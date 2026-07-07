@@ -47,6 +47,97 @@ async function isPresent(page, selector) {
     return page.evaluate((sel) => !!document.querySelector(sel), selector);
 }
 
+// ============================================
+// DIAGNOSTICS
+// Dump the scraper's-eye view from every angle into the key-value store so we
+// can see exactly what CarGurus served the bot: a screenshot, the raw HTML,
+// which filter elements actually rendered, automation tells (webdriver etc.),
+// and any bot-wall vendor fingerprints (cookies / HTML signatures). Each call
+// writes diag-<label>-<time>.{png,html,json} and logs a one-line summary.
+// ============================================
+async function captureDiagnostics(page, label) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const key = `diag-${label}-${stamp}`;
+    const summary = { label, timestamp: new Date().toISOString() };
+
+    try {
+        try {
+            await Actor.setValue(`${key}.png`, await page.screenshot({ fullPage: true }), { contentType: 'image/png' });
+        } catch (e) { summary.screenshotError = e.message; }
+
+        try {
+            const html = await page.content();
+            await Actor.setValue(`${key}.html`, html, { contentType: 'text/html; charset=utf-8' });
+            summary.htmlLength = html.length;
+            const hay = html.toLowerCase();
+            summary.botSignals = [
+                'pardon our interruption', 'distil', 'imperva', 'datadome', 'perimeterx',
+                'px-captcha', 'access denied', 'unusual traffic', 'are you a human',
+                'captcha', 'cf-challenge', 'cloudflare', 'akamai', 'bot detection',
+                'verify you are human', 'enable javascript and cookies', 'request unsuccessful',
+            ].filter((s) => hay.includes(s));
+        } catch (e) { summary.htmlError = e.message; }
+
+        try {
+            const cookieNames = (await page.context().cookies()).map((c) => c.name);
+            summary.cookieCount = cookieNames.length;
+            summary.botVendors = [];
+            if (cookieNames.some((n) => /^visid_incap|^incap_ses|^nlbi_/.test(n))) summary.botVendors.push('Imperva/Incapsula');
+            if (cookieNames.some((n) => n === 'datadome')) summary.botVendors.push('DataDome');
+            if (cookieNames.some((n) => /^_px|^pxvid/.test(n))) summary.botVendors.push('PerimeterX/HUMAN');
+            if (cookieNames.some((n) => /^__cf_bm|^cf_clearance/.test(n))) summary.botVendors.push('Cloudflare');
+            if (cookieNames.some((n) => /^ak_bmsc|^bm_sz|^_abck/.test(n))) summary.botVendors.push('Akamai');
+            summary.cookieNames = cookieNames;
+        } catch (e) { summary.cookieError = e.message; }
+
+        try {
+            const env = await page.evaluate(() => {
+                const q = (sel) => document.querySelectorAll(sel).length;
+                let webgl = {};
+                try {
+                    const gl = document.createElement('canvas').getContext('webgl');
+                    const dbg = gl && gl.getExtension('WEBGL_debug_renderer_info');
+                    if (dbg) webgl = { vendor: gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL), renderer: gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) };
+                } catch (_) {}
+                return {
+                    url: location.href,
+                    title: document.title,
+                    webdriver: navigator.webdriver,
+                    userAgent: navigator.userAgent,
+                    languages: navigator.languages,
+                    platform: navigator.platform,
+                    pluginsCount: navigator.plugins ? navigator.plugins.length : 0,
+                    hardwareConcurrency: navigator.hardwareConcurrency,
+                    deviceMemory: navigator.deviceMemory,
+                    innerSize: `${window.innerWidth}x${window.innerHeight}`,
+                    webgl,
+                    elements: {
+                        distanceSelect: q('select[aria-label="Distance from me"]'),
+                        bodyStyleTrigger: q('#BodyStyle-accordion-trigger'),
+                        bodyStyleContent: q('#BodyStyle-accordion-content'),
+                        bodyCheckboxes: q('button[role="checkbox"][id^="FILTER.BODY_TYPE_GROUP."]'),
+                        makeCheckboxes: q('button[role="checkbox"][id^="FILTER.MAKE_MODEL."]'),
+                        makeTrigger: q('#MakeAndModel-accordion-trigger'),
+                    },
+                };
+            });
+            Object.assign(summary, env);
+        } catch (e) { summary.envError = e.message; }
+
+        await Actor.setValue(`${key}.json`, summary, { contentType: 'application/json' });
+
+        const el = summary.elements || {};
+        console.log(`🔬 [diag:${label}] url=${summary.url || '?'} title=${JSON.stringify(summary.title || '')}`);
+        console.log(`🔬 [diag:${label}] webdriver=${summary.webdriver} plugins=${summary.pluginsCount} webgl=${JSON.stringify(summary.webgl || {})}`);
+        console.log(`🔬 [diag:${label}] elements: distance=${el.distanceSelect} bodyTrigger=${el.bodyStyleTrigger} bodyContent=${el.bodyStyleContent} bodyCbx=${el.bodyCheckboxes} makeCbx=${el.makeCheckboxes}`);
+        console.log(`🔬 [diag:${label}] botVendors=${JSON.stringify(summary.botVendors || [])} botSignals=${JSON.stringify(summary.botSignals || [])} → saved ${key}.{png,html,json}`);
+    } catch (e) {
+        console.log(`🔬 [diag:${label}] capture failed: ${e.message}`);
+    }
+
+    return summary;
+}
+
 async function clickInPage(page, selector) {
     return page.evaluate((sel) => {
         const el = document.querySelector(sel);
@@ -584,7 +675,16 @@ await Actor.main(async () => {
 
         try {
             console.log(`\n🌐 Visiting base page: ${baseUrl}`);
-            await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+            const navResponse = await page.goto(baseUrl, { waitUntil: 'domcontentloaded', timeout: 90000 });
+
+            // Raw HTTP response + bot-vendor fingerprints (headers / cookies)
+            try {
+                const status = navResponse ? navResponse.status() : 'n/a';
+                const headers = navResponse ? await navResponse.allHeaders() : {};
+                const cookieNames = (await context.cookies()).map((c) => c.name);
+                console.log(`🌐 HTTP ${status} | server=${headers.server || '-'} via=${headers.via || '-'} cf-ray=${headers['cf-ray'] || '-'} x-datadome=${headers['x-datadome'] || '-'}`);
+                console.log(`🍪 cookies (${cookieNames.length}): ${cookieNames.join(', ') || '(none)'}`);
+            } catch (_) {}
 
             console.log('⏳ Waiting for page to load...');
             await page.waitForTimeout(5000);
@@ -595,14 +695,24 @@ await Actor.main(async () => {
             await page.mouse.move(300, 400);
             await page.waitForTimeout(1000);
 
+            // Baseline: what does the scraper actually see on a fresh load?
+            if (filterAttempt === 1) {
+                await captureDiagnostics(page, `attempt${filterAttempt}-afterload`);
+            }
+
             const result = await applyFilters(page, filters, searchRadius);
 
             if (result) {
                 filtersSucceeded = true;
+                await captureDiagnostics(page, `attempt${filterAttempt}-success`);
                 break;
             }
+
+            // Filters failed, browser still open — capture the exact failure state.
+            await captureDiagnostics(page, `attempt${filterAttempt}-filterfail`);
         } catch (e) {
             console.log(`  ❌ Browser attempt ${filterAttempt} crashed: ${e.message}`);
+            try { await captureDiagnostics(page, `attempt${filterAttempt}-crash`); } catch (_) {}
         }
 
         if (filterAttempt < 3) {
