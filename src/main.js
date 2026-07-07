@@ -26,28 +26,37 @@ async function applyFilters(page, filters, searchRadius) {
 }
 
 async function ensureAccordionOpen(page, triggerSelector, contentSelector, name) {
-    const trigger = page.locator(triggerSelector).first();
-    const content = page.locator(contentSelector).first();
+    // The whole filters panel remounts whenever CarGurus recomputes its live
+    // listing counts (e.g. right after the radius change), so a held trigger
+    // locator + scrollIntoViewIfNeeded dies with "not attached to the DOM" or
+    // hangs "waiting for element to be stable". Read open-state via a
+    // detach-proof querySelector and force-click a freshly-resolved locator
+    // (no separate scroll) on each retry.
+    const isOpen = async () => page.evaluate(({ tSel, cSel }) => {
+        const t = document.querySelector(tSel);
+        const c = document.querySelector(cSel);
+        return (!!t && t.getAttribute('aria-expanded') === 'true') ||
+               (!!c && c.getAttribute('data-state') === 'open');
+    }, { tSel: triggerSelector, cSel: contentSelector });
 
-    await trigger.waitFor({ state: 'visible', timeout: 90000 });
+    await page.locator(triggerSelector).first().waitFor({ state: 'attached', timeout: 90000 });
 
-    for (let attempt = 1; attempt <= 3; attempt++) {
-        const triggerExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
-        const contentState = await content.getAttribute('data-state').catch(() => null);
+    if (await isOpen()) {
+        console.log(`  ✅ ${name} accordion is open`);
+        return true;
+    }
 
-        if (triggerExpanded === 'true' || contentState === 'open') {
-            console.log(`  ✅ ${name} accordion is open`);
-            return true;
+    for (let attempt = 1; attempt <= 5; attempt++) {
+        try {
+            await page.locator(triggerSelector).first().click({ timeout: 10000, force: true });
+        } catch (err) {
+            // Trigger was replaced by a count re-render mid-click — retry fresh.
+            if (!/not attached|detached|not stable|Timeout/i.test(err.message)) throw err;
         }
 
-        await trigger.scrollIntoViewIfNeeded({ timeout: 10000 });
-        await trigger.click({ timeout: 10000, force: true });
         await page.waitForTimeout(800);
 
-        const updatedExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
-        const updatedContentState = await content.getAttribute('data-state').catch(() => null);
-
-        if (updatedExpanded === 'true' || updatedContentState === 'open') {
+        if (await isOpen()) {
             console.log(`  ✅ Opened ${name} accordion`);
             return true;
         }
@@ -279,7 +288,8 @@ async function clickMakeCheckbox(page, make) {
 
         try {
             await locator.waitFor({ state: 'attached', timeout: 3000 });
-            await locator.scrollIntoViewIfNeeded({ timeout: 5000 });
+            // No scrollIntoViewIfNeeded — the make list also remounts on count
+            // recompute; force-click below handles scrolling and detaches.
             await page.waitForTimeout(300);
 
             const checkbox = page.locator(`button[role="checkbox"][id="FILTER.MAKE_MODEL.${normalizedMake}"]`).first();
