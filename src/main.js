@@ -141,9 +141,21 @@ async function setSearchRadius(page, searchRadius) {
         }
 
         await dropdown.selectOption(optionValue, { timeout: 90000 });
-        await page.waitForTimeout(2000);
 
-        const selectedValue = await dropdown.inputValue();
+        // Changing the radius makes CarGurus recompute every listing count in the
+        // filter panel, which remounts the <select>. Verify with fresh re-queries
+        // (never a held locator) so a mid-render detach doesn't hang inputValue().
+        let selectedValue = null;
+        for (let attempt = 0; attempt < 15; attempt++) {
+            await page.waitForTimeout(1000);
+            selectedValue = await page.evaluate(() => {
+                const select = document.querySelector(
+                    'select[data-testid="select-filter-distance"], select[aria-label="Distance from me"]'
+                );
+                return select ? select.value : null;
+            });
+            if (selectedValue === optionValue) break;
+        }
 
         if (selectedValue !== optionValue) {
             throw new Error(`Distance dropdown value mismatch. Expected ${optionValue}, got ${selectedValue}`);
@@ -173,28 +185,44 @@ async function applyBodyTypeFilter(page, bodyTypes) {
 
         await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
 
+        // CarGurus now renders a live listing count inside each option's aria-label
+        // (e.g. "SUV / Crossover (9,140)"). Those counts recompute whenever another
+        // filter changes, remounting the checkbox nodes — so any action that waits
+        // for the element to be "stable" (scrollIntoViewIfNeeded) loses it mid-flight
+        // with "not attached to the DOM". Match by aria-label prefix, read state via
+        // a detach-proof querySelector, and click a freshly-resolved locator on retry.
         const clickCheckboxByAriaLabelContains = async (groupName, labelText) => {
-            const checkbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
+            const selector = `button[role="checkbox"][aria-label^="${labelText}"]`;
 
-            await checkbox.waitFor({ state: 'attached', timeout: 90000 });
-            await checkbox.scrollIntoViewIfNeeded({ timeout: 10000 });
+            const readChecked = async () => page.evaluate((sel) => {
+                const el = document.querySelector(sel);
+                return el ? el.getAttribute('aria-checked') : null;
+            }, selector);
 
-            const checkedBefore = await checkbox.getAttribute('aria-checked');
-            if (checkedBefore === 'true') {
+            await page.locator(selector).first().waitFor({ state: 'attached', timeout: 90000 });
+
+            if (await readChecked() === 'true') {
                 console.log(`  ✅ ${groupName}: ${labelText} already selected`);
                 return true;
             }
 
-            await checkbox.click({ timeout: 30000, force: true });
-            await page.waitForTimeout(700);
+            for (let attempt = 1; attempt <= 5; attempt++) {
+                try {
+                    await page.locator(selector).first().click({ timeout: 15000, force: true });
+                } catch (err) {
+                    // Node was replaced by a count re-render mid-click — retry fresh.
+                    if (!/not attached|detached|not stable/i.test(err.message)) throw err;
+                }
 
-            const checkedAfter = await checkbox.getAttribute('aria-checked');
-            if (checkedAfter !== 'true') {
-                throw new Error(`${groupName}: clicked ${labelText}, but aria-checked is ${checkedAfter}`);
+                await page.waitForTimeout(800);
+
+                if (await readChecked() === 'true') {
+                    console.log(`  ✅ ${groupName}: Added ${labelText}`);
+                    return true;
+                }
             }
 
-            console.log(`  ✅ ${groupName}: Added ${labelText}`);
-            return true;
+            throw new Error(`${groupName}: clicked ${labelText}, but aria-checked never became true`);
         };
 
         for (const bodyType of bodyTypes) {
