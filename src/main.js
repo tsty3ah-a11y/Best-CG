@@ -179,11 +179,30 @@ async function setSearchRadius(page, searchRadius) {
 // state from a fresh locator. Only invoked AFTER the normal path has thrown, so
 // the happy path is left exactly as it was.
 // ============================================================
-async function clickCheckboxDetachProof(page, selector, name, maxAttempts = 6) {
+async function clickCheckboxDetachProof(page, selectorOrCandidates, name, maxAttempts = 6) {
+    const candidates = Array.isArray(selectorOrCandidates) ? selectorOrCandidates : [selectorOrCandidates];
+
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
-            const cb = page.locator(selector).first();
-            await cb.waitFor({ state: 'attached', timeout: 15000 });
+            let cb = null;
+            let activeSelector = null;
+
+            for (const cand of candidates) {
+                const hit = await page.locator(cand).first()
+                    .waitFor({ state: 'attached', timeout: candidates.length > 1 ? 3000 : 15000 })
+                    .then(() => true).catch(() => false);
+                if (hit) {
+                    cb = page.locator(cand).first();
+                    activeSelector = cand;
+                    break;
+                }
+            }
+
+            if (!cb) {
+                console.log(`  ⚠️ [detach-proof] ${name} attempt ${attempt}/${maxAttempts} threw: None of the selectors matched`);
+                await page.waitForTimeout(1000);
+                continue;
+            }
 
             const before = await cb.getAttribute('aria-checked').catch(() => null);
             if (before === 'true') {
@@ -197,7 +216,7 @@ async function clickCheckboxDetachProof(page, selector, name, maxAttempts = 6) {
             await page.waitForTimeout(600);
 
             // Re-read from a FRESH locator — the clicked handle may be detached.
-            const after = await page.locator(selector).first()
+            const after = await page.locator(activeSelector).first()
                 .getAttribute('aria-checked').catch(() => null);
             if (after === 'true') {
                 console.log(`  ✅ [detach-proof] ${name} selected (attempt ${attempt}/${maxAttempts})`);
@@ -205,14 +224,11 @@ async function clickCheckboxDetachProof(page, selector, name, maxAttempts = 6) {
             }
 
             console.log(`  ⚠️ [detach-proof] ${name} still ${after} after attempt ${attempt}/${maxAttempts} — retrying`);
-        } catch (err) {
-            console.log(`  ⚠️ [detach-proof] ${name} attempt ${attempt}/${maxAttempts} threw: ${err.message} — re-locating`);
+        } catch (error) {
+            console.log(`  ⚠️ [detach-proof] ${name} attempt ${attempt}/${maxAttempts} threw: ${error.message} — re-locating`);
         }
-
-        await page.waitForTimeout(700);
+        await page.waitForTimeout(1000);
     }
-
-    console.log(`  ❌ [detach-proof] ${name} could not be selected after ${maxAttempts} attempts`);
     return false;
 }
 
@@ -233,12 +249,12 @@ async function applyBodyTypeFilter(page, bodyTypes) {
                 : null;
 
             const candidates = [
-                `button[role="checkbox"][aria-label*="${labelText}"]`,
                 ...(groupId ? [
                     `[data-testid="checkbox-FILTER.BODY_TYPE_GROUP.${groupId}"]`,
                     `button[role="checkbox"][id="FILTER.BODY_TYPE_GROUP.${groupId}"]`,
                     `[data-testid*="BODY_TYPE_GROUP.${groupId}"]`,
                 ] : []),
+                `button[role="checkbox"][aria-label*="${labelText}"]`,
                 `button[role="checkbox"][aria-label*="${labelText.split(' / ')[0]}"]`,
             ];
 
@@ -311,7 +327,7 @@ async function applyBodyTypeFilter(page, bodyTypes) {
                     throw new Error(`${groupName}: ${labelText} checkbox is not present in the panel (no known selector matched)`);
                 }
                 console.log(`  ⚠️ ${groupName}: ${labelText} primary click failed (${primaryError.message}) — engaging detach-proof fallback`);
-                const ok = await clickCheckboxDetachProof(page, selector, `${groupName}: ${labelText}`);
+                const ok = await clickCheckboxDetachProof(page, candidates, `${groupName}: ${labelText}`);
                 if (!ok) {
                     throw new Error(`${groupName}: ${labelText} could not be selected (primary + fallback both failed)`);
                 }
@@ -405,8 +421,7 @@ async function clickMakeCheckbox(page, make) {
     // Only runs after the normal path is already exhausted, so it can't affect
     // a good run.
     console.log(`  ⚠️ ${make}: all selectors failed — engaging detach-proof fallback`);
-    const idSelector = `button[role="checkbox"][id="FILTER.MAKE_MODEL.${normalizedMake}"]`;
-    if (await clickCheckboxDetachProof(page, idSelector, make)) {
+    if (await clickCheckboxDetachProof(page, selectors, make)) {
         return true;
     }
 
@@ -467,7 +482,7 @@ async function applyPriceFilter(page) {
         await ensureAccordionOpen(page, '#Price-accordion-trigger', '#Price-accordion-content', 'Price');
 
         // Find the MINIMUM slider specifically (not maximum)
-        const minSlider = page.locator('[role="slider"][aria-label="Minimum"]');
+        const minSlider = page.locator('#Price-accordion-content [role="slider"][aria-label="Minimum"]').first();
         await minSlider.waitFor({ state: 'visible', timeout: 90000 });
 
         // Click on the minimum slider to focus it
@@ -1095,7 +1110,20 @@ await Actor.main(async () => {
                         console.log(`  ✅ Clicked Next button (${i + 1}/${clicksNeeded})`);
 
                         // Wait for new page to load
-                        await page.waitForTimeout(4000);
+                        const expectedAfterClick = currentPageNumber + i + 1;
+                        let reached = false;
+                        for (let w = 0; w < 20; w++) { // up to 20s wait
+                            await page.waitForTimeout(1000);
+                            const p = await readCurrentPageFromDom(page);
+                            if (p === expectedAfterClick) {
+                                reached = true;
+                                break;
+                            }
+                        }
+                        if (!reached) {
+                            console.log(`  ⚠️ Pager did not update to ${expectedAfterClick} after click. Page loading may be slow or reached end of results.`);
+                            await page.waitForTimeout(2000); // Give it one more small wait
+                        }
                     } catch (error) {
                         console.log(`  ⚠️ Next button click failed: ${error.message}`);
 
