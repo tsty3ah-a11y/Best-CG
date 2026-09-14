@@ -692,7 +692,7 @@ async function expandFilterSections(page) {
     // indices we are iterating over.
     let opened = 0;
     for (let pass = 1; pass <= 3; pass++) {
-        const triggers = panel.locator('button[aria-expanded="false"], [role="button"][aria-expanded="false"]');
+        const triggers = panel.locator('button[aria-expanded="false"]:not([role="checkbox"]):not([role="switch"]):not([type="checkbox"]), [role="button"][aria-expanded="false"]:not([role="checkbox"]):not([role="switch"]):not([type="checkbox"])');
         const count = await triggers.count().catch(() => 0);
         if (count === 0) break;
 
