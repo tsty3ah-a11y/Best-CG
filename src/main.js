@@ -20,6 +20,7 @@ async function applyFilters(page, filters, searchRadius) {
     }
     if (!await applyPriceFilter(page)) return false;
     if (!await applyDealRatingFilter(page, filters.dealRatings)) return false;
+    if (!await applySortByBestDeals(page)) return false;
 
     console.log('✅ All filters applied successfully!');
     return true;
@@ -500,7 +501,20 @@ async function applyPriceFilter(page) {
             await page.waitForTimeout(50); // Small delay between presses
         }
 
-        console.log(`  ✅ Minimum price set to $35,000`);
+        // The 24 presses are a guess: keypresses get lost when the panel re-renders,
+        // and the step scale moves with the result set ($12k–$41k observed). Read the
+        // slider back and walk it to the target. Never leave it ABOVE the target —
+        // that would hide good cars; slightly below is harmless (n8n enforces $35k).
+        const landed = await correctMinPriceSlider(page, minSlider, 35000);
+        if (landed === null) {
+            console.log(`  ⚠️ Could not read the slider value — keeping the 24-press position`);
+        } else if (landed > 35000) {
+            console.log(`  ❌ Minimum price stuck at $${landed.toLocaleString()} (above $35,000) — retrying filters`);
+            return false;
+        } else {
+            console.log(`  ✅ Minimum price set to $${landed.toLocaleString()}`);
+        }
+
         await page.waitForTimeout(2000); // Wait for results to update
         return true;
 
@@ -508,6 +522,70 @@ async function applyPriceFilter(page) {
         console.log(`  ❌ Price filter failed: ${error.message}`);
         return false;
     }
+}
+
+// Dollar value of the price slider: aria-valuetext ("$35,000"), else aria-valuenow
+// when it is clearly dollars rather than a step index. null when unreadable.
+async function readSliderDollars(slider) {
+    const vals = await slider.evaluate((el) => ({
+        text: el.getAttribute('aria-valuetext') || '',
+        now: el.getAttribute('aria-valuenow') || '',
+    })).catch(() => null);
+    if (!vals) return null;
+    const fromText = parseInt(vals.text.replace(/[^\d]/g, ''), 10);
+    if (Number.isFinite(fromText) && fromText >= 1000) return fromText;
+    const fromNow = Number(vals.now);
+    if (Number.isFinite(fromNow) && fromNow >= 1000) return fromNow;
+    return null;
+}
+
+// Step the focused slider until it reads `target`, or the closest value just
+// below it when the scale has no exact stop. Returns the final dollar value.
+async function correctMinPriceSlider(page, slider, target) {
+    let value = await readSliderDollars(slider);
+    if (value === null) return null;
+    console.log(`  💵 Slider reads $${value.toLocaleString()} after 24 presses`);
+    if (value === target) return value;
+
+    for (let i = 0; i < 60 && value !== target; i++) {
+        const key = value < target ? 'ArrowRight' : 'ArrowLeft';
+        await slider.focus().catch(() => {}); // re-render can steal focus
+        await page.keyboard.press(key);
+        await page.waitForTimeout(150);
+
+        let next = await readSliderDollars(slider);
+        if (next === null) return value;
+        // Did not move — the press was lost (re-render) or we are at an end stop.
+        // Re-press a few times before concluding it is an end stop.
+        for (let retry = 0; retry < 3 && next === value; retry++) {
+            await page.waitForTimeout(300);
+            await slider.focus().catch(() => {});
+            await page.keyboard.press(key);
+            await page.waitForTimeout(150);
+            next = await readSliderDollars(slider);
+            if (next === null) return value;
+        }
+        if (next === value) break;
+        // Crossed the target going down: slightly below is the safe side, stop.
+        if (value > target && next < target) {
+            value = next;
+            break;
+        }
+        // Crossed the target going up: the scale has no exact stop, step back once.
+        if (value < target && next > target) {
+            await slider.focus().catch(() => {});
+            await page.keyboard.press('ArrowLeft');
+            await page.waitForTimeout(300);
+            value = (await readSliderDollars(slider)) ?? next;
+            break;
+        }
+        value = next;
+    }
+
+    if (value !== target) {
+        console.log(`  ⚠️ No exact $${target.toLocaleString()} stop — slider settled at $${value.toLocaleString()}`);
+    }
+    return value;
 }
 
 async function applyDealRatingFilter(page, dealRatings) {
@@ -535,6 +613,71 @@ async function applyDealRatingFilter(page, dealRatings) {
         console.log(`  ❌ Deal rating filter failed: ${error.message}`);
         return false;
     }
+}
+
+// Which sort is active? Newer SRP renders it as
+//   <span role="textbox" aria-readonly="true" aria-label="Best deals first">Sort by: Best deals first</span>
+// older one as the "Sort by:" combobox button. '' when neither is found.
+async function readSelectedSort(page) {
+    return await page.evaluate(() => {
+        const tb = Array.from(document.querySelectorAll('[role="textbox"][aria-readonly="true"]'))
+            .find((el) => /sort by/i.test(el.textContent || ''));
+        if (tb) return (tb.getAttribute('aria-label') || tb.textContent || '').trim();
+        const cb = document.querySelector('button[role="combobox"][aria-label="Sort by:"]');
+        return cb ? (cb.textContent || '').trim() : '';
+    }).catch(() => '');
+}
+
+// Open the sort dropdown and pick `optionText`, verifying it actually took.
+// Tries the NEW textbox control first; the ORIGINAL combobox is the fallback.
+// A click only counts once readSelectedSort() confirms it — never assumed.
+async function selectSortOption(page, optionText, isSelected) {
+    const current = await readSelectedSort(page);
+    if (isSelected(current)) {
+        console.log(`  ✅ Already sorted by "${current}"`);
+        return true;
+    }
+    console.log(`  ℹ️ Current sort: "${current || 'unknown'}"`);
+
+    const controls = [
+        { name: 'new textbox', selector: '[role="textbox"][aria-readonly="true"]:has-text("Sort by")', timeout: 15000 },
+        { name: 'original combobox', selector: 'button[role="combobox"][aria-label="Sort by:"]', timeout: 90000 },
+    ];
+    const optionSelector =
+        `div[role="option"]:has-text("${optionText}"), [role="option"]:has-text("${optionText}"), li:has-text("${optionText}")`;
+
+    for (const control of controls) {
+        try {
+            const sortControl = page.locator(control.selector).first();
+            await sortControl.waitFor({ state: 'visible', timeout: control.timeout });
+            await sortControl.click({ timeout: 90000 });
+            console.log(`  ✅ Opened sort dropdown (${control.name})`);
+            await page.waitForTimeout(1000);
+
+            await page.click(optionSelector, { timeout: 90000 });
+            await page.waitForTimeout(2000); // Wait for results to update
+
+            const selected = await readSelectedSort(page);
+            if (isSelected(selected)) {
+                console.log(`  ✅ Selected "${selected}" (verified)`);
+                return true;
+            }
+            console.log(`  ⚠️ Clicked "${optionText}" via ${control.name} but sort shows "${selected}"`);
+        } catch (error) {
+            console.log(`  ⚠️ Sort via ${control.name} failed: ${error.message}`);
+        }
+        await page.keyboard.press('Escape').catch(() => {});
+    }
+    return false;
+}
+
+async function applySortByBestDeals(page) {
+    console.log(`🏆 Setting sort order to: Best deals first`);
+    // CarGurus now opens on "Best matches" (random mix) — never accept that.
+    // "Best deal" substring hits "Best deals first", never "Best matches".
+    const ok = await selectSortOption(page, 'Best deal', (s) => /best deal/i.test(s));
+    if (!ok) console.log(`  ❌ Sort by best deals failed`);
+    return ok;
 }
 
 // ============================================================
